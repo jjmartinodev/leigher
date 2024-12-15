@@ -1,130 +1,132 @@
-use glam::{vec3, Mat4, Vec3};
+use std::sync::Arc;
 
-struct Grid {
-    voxels: Vec<u8>,
-    width: usize,
-    height: usize,
-    depth: usize,
+use pollster::FutureExt;
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::EventLoop,
+    window::{Window, WindowAttributes},
+};
+
+pub struct Wgpu<'a> {
+    surface: wgpu::Surface<'a>,
+    surface_config: wgpu::SurfaceConfiguration,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
 }
 
-struct Ray {
-    position: Vec3,
-    direction: Vec3,
+pub struct App<'a> {
+    window: Option<Arc<winit::window::Window>>,
+    wgpu: Option<Wgpu<'a>>,
 }
 
-#[derive(Debug)]
-struct Hit {
-    position: Vec3,
-    normal: Vec3,
-}
+impl<'a> Wgpu<'a> {
+    pub fn new(window: Arc<Window>) -> Wgpu<'a> {
+        let size = window.inner_size();
 
-impl Ray {
-    pub fn calculate_hit(&self, grid: &Grid) -> Option<Hit> {
-        let mut position = self.position;
-        let difference = self.position - (self.position + self.direction);
-        let mut current_voxel = self.position.floor().as_ivec3();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
 
-        let step = difference.signum().as_ivec3();
-        let next_voxel_boundary = current_voxel.as_vec3() + 0.5 * step.as_vec3();
-        let mut tmax = (next_voxel_boundary - self.position) / difference;
-        let tdelta = step.as_vec3() / difference;
+        let surface = instance.create_surface(window).unwrap();
 
-        let mut normal;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptionsBase {
+                compatible_surface: Some(&surface),
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+            })
+            .block_on()
+            .unwrap();
 
-        for _ in 0..100 {
-            if tmax.x < tmax.y {
-                if tmax.x < tmax.z {
-                    current_voxel.x += step.x;
-                    tmax.x += tdelta.x;
-                    position.x += step.x as f32;
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                    ..Default::default()
+                },
+                None,
+            )
+            .block_on()
+            .unwrap();
 
-                    normal = Vec3::new(-step.x as f32, 0.0, 0.0);
-                } else {
-                    current_voxel.z += step.z;
-                    tmax.z += tdelta.z;
-                    position.z += step.z as f32;
+        let capabilites = surface.get_capabilities(&adapter);
+        let format = capabilites.formats[0];
+        let config = wgpu::SurfaceConfiguration {
+            width: size.width,
+            height: size.height,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            desired_maximum_frame_latency: 2,
+            format,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
 
-                    normal = Vec3::new(0.0, 0.0, -step.z as f32);
-                }
-            } else if tmax.y < tmax.z {
-                current_voxel.y += step.y;
-                tmax.y += tdelta.y;
-                position.y += step.y as f32;
+        surface.configure(&device, &config);
 
-                normal = Vec3::new(0.0, -step.y as f32, 0.0);
-            } else {
-                current_voxel.z += step.z;
-                tmax.z += tdelta.z;
-                position.z += step.z as f32;
-
-                normal = Vec3::new(0.0, 0.0, -step.z as f32);
-            }
-
-            let x_coord = current_voxel.x.clamp(0, grid.width as i32 - 1) as usize;
-            let y_coord = current_voxel.y.clamp(0, grid.height as i32 - 1) as usize;
-            let z_coord = current_voxel.z.clamp(0, grid.depth as i32 - 1) as usize;
-
-            position -= normal;
-
-            if grid.voxels[x_coord + y_coord * grid.width + z_coord * grid.width * grid.height] == 1
-            {
-                return Some(Hit { position, normal });
-            }
+        Wgpu {
+            surface,
+            surface_config: config,
+            device,
+            queue,
         }
-
-        return None;
     }
 }
 
-impl Grid {
-    pub fn square(width: usize, height: usize, depth: usize) -> Grid {
-        let mut voxels = vec![0; width * height * depth];
-        let h = height / 4;
-        let w = width / 4;
-        let d = depth / 4;
-        for y in h * 1..h * 3 {
-            for x in w * 1..w * 3 {
-                for z in d * 1..d * 3 {
-                    voxels[x + y * width + z * (width * height)] = 1;
-                }
-            }
-        }
-
-        Grid {
-            voxels,
-            width,
-            depth,
-            height,
+impl<'a> ApplicationHandler for App<'a> {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.window.is_none() {
+            let window = Arc::new(
+                event_loop
+                    .create_window(WindowAttributes::default())
+                    .unwrap(),
+            );
+            self.wgpu = Some(Wgpu::new(window.clone()));
+            self.window = Some(window);
         }
     }
 
-    pub fn circle(width: usize, height: usize, depth: usize) -> Grid {
-        let mut voxels = vec![0; width * height * depth];
-
-        let center = vec3(width as f32, height as f32, depth as f32) * 0.5;
-
-        for y in 0..height {
-            for x in 0..width {
-                for z in 0..depth {
-                    let point = vec3(x as f32, y as f32, z as f32);
-                    if point.distance_squared(center) < 10.0f32.powf(2.0) {
-                        voxels[x + y * width + z * (width * height)] = 1;
-                    }
-                }
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.wgpu = None;
+                self.window = None;
+                event_loop.exit();
             }
-        }
-
-        Grid {
-            voxels,
-            width,
-            depth,
-            height,
+            WindowEvent::RedrawRequested => {
+                self.window.as_ref().unwrap().pre_present_notify();
+            }
+            WindowEvent::Resized(size) => {
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
+                let _wgpu = self.wgpu.as_mut().unwrap();
+                _wgpu.surface_config.width = size.width;
+                _wgpu.surface_config.height = size.height;
+                _wgpu
+                    .surface
+                    .configure(&_wgpu.device, &_wgpu.surface_config);
+            }
+            _ => (),
         }
     }
 }
 
 fn main() {
-    let grid = Grid::circle(40, 40, 40);
-}
+    let mut app = App {
+        window: None,
+        wgpu: None,
+    };
 
-/*ray.direction - 2.0 * hit.normal.dot(ray.direction) * hit.normal*/
+    let event_loop = EventLoop::new().unwrap();
+    event_loop.run_app(&mut app).unwrap();
+}
