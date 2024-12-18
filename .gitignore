@@ -1,4 +1,0 @@
-dependencies/glfw/*
-dependencies/glew/*
-.vscode
-build/**
